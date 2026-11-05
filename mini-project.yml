@@ -1,0 +1,158 @@
+name: Jenkins CI/CD and Terraform Mini Project
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_VAR_offline_validation: "true"
+      AWS_ACCESS_KEY_ID: dummy
+      AWS_SECRET_ACCESS_KEY: dummy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: T01 Identity
+        run: |
+          echo "Name: Aditya Ubale | PRN: 202301040111"
+          echo "IA Activity 3: Jenkins CI/CD + Terraform Mini Project"
+          date
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: T02 Terraform version and layout
+        run: |
+          terraform version
+          find . -name "*.tf" -o -name "*.tfvars" | sort
+
+      - name: T03 terraform fmt (all configurations)
+        run: terraform fmt -check -recursive -diff && echo "fmt OK"
+
+      - name: T04 AWS configuration - terraform init
+        working-directory: terraform/aws
+        run: terraform init -backend=false
+
+      - name: T05 AWS configuration - terraform validate
+        working-directory: terraform/aws
+        run: terraform validate
+
+      - name: T06 AWS plan - dev environment
+        working-directory: terraform/aws
+        run: terraform plan -no-color -var-file=envs/dev.tfvars
+
+      - name: T07 AWS plan - prod environment
+        working-directory: terraform/aws
+        run: terraform plan -no-color -var-file=envs/prod.tfvars
+
+      - name: T08 Local environment - init and plan
+        working-directory: terraform/local-demo
+        run: |
+          terraform init
+          terraform validate
+          terraform plan -no-color -var "build_number=1"
+
+      - name: T09 Local environment - terraform apply
+        working-directory: terraform/local-demo
+        run: terraform apply -auto-approve -no-color -var "build_number=1"
+
+      - name: T10 Show provisioned resources
+        working-directory: terraform/local-demo
+        run: |
+          terraform output
+          terraform state list
+          echo "--- app.env ---"; cat deploy/staging/app.env
+          echo "--- release.json ---"; cat deploy/staging/release.json; echo
+
+      - name: T11 Re-run plan (idempotency, no changes expected)
+        working-directory: terraform/local-demo
+        run: terraform plan -no-color -var "build_number=1"
+
+      - name: T12 terraform destroy (clean up)
+        working-directory: terraform/local-demo
+        run: |
+          terraform destroy -auto-approve -no-color -var "build_number=1"
+          echo "--- deploy folder after destroy ---"
+          ls -la deploy/staging 2>&1 || true
+
+  jenkins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: J1 Identity
+        run: |
+          echo "Name: Aditya Ubale | PRN: 202301040111"
+          date
+
+      - name: J2 Build Jenkins image
+        run: docker build -t jenkins-demo jenkins
+
+      - name: J3 Start Jenkins
+        run: |
+          docker run -d --name jenkins -p 8080:8080 \
+            -e REPO_URL="https://github.com/${{ github.repository }}.git" \
+            -e BRANCH="*/${{ github.ref_name }}" \
+            jenkins-demo
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/login >/dev/null && echo "Jenkins is up" && break
+            sleep 5
+          done
+
+      - name: J4 Trigger pipeline build
+        run: |
+          CRUMB=$(curl -s -c cj.txt http://localhost:8080/crumbIssuer/api/json | python3 -c "import sys,json;print(json.load(sys.stdin)['crumb'])")
+          curl -s -b cj.txt -X POST -H "Jenkins-Crumb: $CRUMB" -o /dev/null -w "trigger HTTP %{http_code}\n" \
+            http://localhost:8080/job/inventory-cicd-pipeline/build
+
+      - name: J5 Wait for build and print console log
+        run: |
+          for i in $(seq 1 120); do
+            R=$(curl -s http://localhost:8080/job/inventory-cicd-pipeline/1/api/json || true)
+            if echo "$R" | grep -q '"building":false'; then break; fi
+            sleep 5
+          done
+          curl -s http://localhost:8080/job/inventory-cicd-pipeline/1/consoleText | tee console.txt
+          echo "-------- RESULT --------"
+          curl -s http://localhost:8080/job/inventory-cicd-pipeline/1/api/json | python3 -c "import sys,json;print(json.load(sys.stdin)['result'])" | tee result.txt
+          grep -q SUCCESS result.txt
+
+      - name: J6 Screenshots of Jenkins UI
+        if: always()
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+          python3 - <<'PY'
+          from playwright.sync_api import sync_playwright
+          base = "http://localhost:8080"
+          job = "/job/inventory-cicd-pipeline"
+          pages = {
+            "1_dashboard": "/",
+            "2_job_stage_view": job + "/",
+            "3_console_output": job + "/1/console",
+            "4_test_results": job + "/1/testReport/",
+            "5_build_overview": job + "/1/",
+            "6_pipeline_steps": job + "/1/flowGraphTable/",
+          }
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              pg = b.new_page(viewport={"width": 1400, "height": 900})
+              for name, path in pages.items():
+                  pg.goto(base + path); pg.wait_for_timeout(2500)
+                  pg.screenshot(path=name + ".png", full_page=True)
+              b.close()
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jenkins-evidence
+          path: |
+            *.png
+            console.txt

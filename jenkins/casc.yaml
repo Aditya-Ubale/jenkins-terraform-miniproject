@@ -1,0 +1,23 @@
+jenkins:
+  systemMessage: "Jenkins CI/CD + Terraform Mini Project | Aditya Ubale | PRN 202301040111"
+  numExecutors: 2
+  authorizationStrategy: unsecured
+security:
+  globalJobDslSecurityConfiguration:
+    useScriptSecurity: false
+jobs:
+  - script: >
+      pipelineJob('inventory-cicd-pipeline') {
+        description('Checkout from GitHub, lint, test, build, Terraform validate/plan/apply and deploy')
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote { url('${REPO_URL}') }
+                branch('${BRANCH}')
+              }
+            }
+            scriptPath('Jenkinsfile')
+          }
+        }
+      }
